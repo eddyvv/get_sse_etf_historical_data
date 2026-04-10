@@ -161,9 +161,10 @@ def fetch_day(date_str):
 
 # ── 4. 通用抓取循环（供两种模式复用） ─────────────────────────────────────────
 
-def fetch_dates(date_list, existing_dates, mode_label):
+def fetch_dates(date_list, existing_dates, mode_label, is_recent=False):
     """
     对 date_list 中尚未在 existing_dates 里的日期逐一抓取。
+    is_recent=True 时，nodata 提示改为"数据未发布/非交易日"，避免误判。
     返回 (new_records列表, stop_reason)
     stop_reason: 'completed' | 'network' | 'interrupt'
     """
@@ -186,7 +187,11 @@ def fetch_dates(date_list, existing_dates, mode_label):
 
             elif status == 'nodata':
                 net_fail_count = 0
-                print('— (非交易日)')
+                # 增量模式下接口可能存在数据延迟，不能简单判定为非交易日
+                if is_recent:
+                    print('— (数据未发布或非交易日)')
+                else:
+                    print('— (非交易日)')
 
             elif status == 'neterr':
                 net_fail_count += 1
@@ -292,7 +297,7 @@ def incremental_update():
     # 正序抓取（从旧到新），便于连续失败时已有较早数据
     date_list = list(reversed(candidates))
 
-    new_records, stop_reason = fetch_dates(date_list, existing_dates, '增量')
+    new_records, stop_reason = fetch_dates(date_list, existing_dates, '增量', is_recent=True)
 
     # 合并去重，保持倒序（与历史下载一致）
     merged_map = {r['date']: r for r in existing_results}
@@ -400,7 +405,7 @@ def incremental_update():
     existing_results = read_all_results()
     existing_dates   = {r['date'] for r in existing_results}
 
-    new_records, stop_reason = fetch_dates(date_list, existing_dates, '增量')
+    new_records, stop_reason = fetch_dates(date_list, existing_dates, '增量', is_recent=True)
 
     # 合并去重，保持倒序
     merged_map = {r['date']: r for r in existing_results}
@@ -670,18 +675,19 @@ def main():
     # 只要 latest 不是今天，就尝试从 latest 的次日到今天补充新数据
     need_increment = (latest is None or latest < today)
     if need_increment:
-        print(f'▶  Step 1：增量更新 — 补充 {(latest or "无") + " 之后"} 到今天的新数据')
+        print(f'▶  Step 1：增量更新 — 检查 {latest or "无"} 之后到今天（{today}）的新数据')
+        print(f'   注意：若今天返回"数据未发布"属正常现象，交易所数据通常在收盘后更新')
         results, new_count = incremental_update()
         if new_count > 0:
             print(f'   本次新增 {new_count} 个交易日。')
         else:
-            print('   近期无新交易日数据（节假日或数据尚未发布）。')
+            print('   今天及近期暂无可用新数据（可能是节假日，或数据尚未发布，下次运行会继续重试）。')
         # 增量完成后刷新 existing_dates / earliest
         existing_dates = get_existing_dates()
         earliest       = min(existing_dates) if existing_dates else None
         history_done   = (earliest is not None and earliest <= CUTOFF_DATE.strftime('%Y-%m-%d'))
     else:
-        print(f'▶  Step 1：增量更新 — 今天数据已存在，跳过。')
+        print(f'▶  Step 1：增量更新 — {today} 数据已存在，跳过。')
         results = read_all_results()
 
     # ── Step 2：历史补全（把数据向过去补到 2020-01-01） ──────────────────────
