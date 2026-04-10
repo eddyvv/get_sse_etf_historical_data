@@ -94,19 +94,25 @@ def save_checkpoint(results, note=''):
     os.replace(tmp, CHECKPOINT)
 
 
-def history_is_complete():
-    """checkpoint 存在且 note 含'完成'，认为历史数据已全量下载完毕。"""
+def today_str():
+    """返回当天日期字符串 YYYY-MM-DD。"""
+    return datetime.today().strftime('%Y-%m-%d')
+
+
+def get_existing_dates():
+    """返回 checkpoint 中所有已有日期的集合，文件不存在时返回空集合。"""
     if not os.path.exists(CHECKPOINT):
-        return False
+        return set()
     try:
         with open(CHECKPOINT, 'r', encoding='utf-8') as f:
-            return '完成' in json.load(f).get('note', '')
+            results = json.load(f).get('results', [])
+        return {r['date'] for r in results}
     except Exception:
-        return False
+        return set()
 
 
 def read_latest_date():
-    """读取 checkpoint 中最新（最大）的日期，作为增量更新起点。"""
+    """读取 checkpoint 中最新（最大）的日期。"""
     try:
         with open(CHECKPOINT, 'r', encoding='utf-8') as f:
             return json.load(f).get('first_date', None)
@@ -204,6 +210,112 @@ def fetch_dates(date_list, existing_dates, mode_label):
 
 
 # ── 5. 历史下载模式 ────────────────────────────────────────────────────────────
+
+def collect_history():
+    """
+    从今天/断点起向过去方向逐日抓取，直到 CUTOFF_DATE 或 TARGET_DAYS。
+    返回 (results, completed布尔)
+    """
+    results, last_date = load_checkpoint()
+    existing_dates     = {r['date'] for r in results}
+
+    if last_date:
+        start = datetime.strptime(last_date, '%Y-%m-%d') - timedelta(days=1)
+        print(f'▶  历史下载（续传），从 {start.strftime("%Y-%m-%d")} 继续向前')
+    else:
+        start = datetime.today()
+        print(f'▶  历史下载（首次），从今天起向前追溯')
+
+    print(f'   目标 {TARGET_DAYS} 个交易日 | 截止 {CUTOFF_DATE.strftime("%Y-%m-%d")}')
+    print('   Ctrl+C 可随时中断并保存进度')
+    print('=' * 60)
+
+    # 生成待抓日期列表（倒序：从 start 到 CUTOFF_DATE）
+    date_list = []
+    d = start
+    while d >= CUTOFF_DATE and (len(existing_dates) + len(date_list)) < TARGET_DAYS:
+        date_list.append(d.strftime('%Y-%m-%d'))
+        d -= timedelta(days=1)
+
+    new_records, stop_reason = fetch_dates(date_list, existing_dates, '历史')
+
+    # 合并
+    for r in new_records:
+        results.append(r)
+        existing_dates.add(r['date'])
+        save_checkpoint(results, note='运行中')   # 实时持久化
+
+    completed = (stop_reason == 'completed')
+
+    if stop_reason == 'interrupt':
+        save_checkpoint(results, note='Ctrl+C 中断')
+        print(f'✅ 已保存 {len(results)} 个交易日 → {CHECKPOINT}，下次运行自动续传')
+    elif stop_reason == 'network':
+        save_checkpoint(results, note='断网自动保存')
+        print(f'🔌 断网，已保存 {len(results)} 个交易日 → {CHECKPOINT}，恢复网络后重新运行')
+    else:
+        save_checkpoint(results, note='全量采集完成')
+        print(f'✅ 历史数据采集完成，共 {len(results)} 个交易日，断点文件永久保留')
+
+    return results, completed
+
+
+# ── 6. 增量更新模式 ────────────────────────────────────────────────────────────
+
+def incremental_update():
+    """
+    增量更新：从今天起往前逐日检查，遇到已在 checkpoint 中的日期即停止。
+    将新抓到的数据追加合并后保存。
+    返回 (merged_results列表, 新增天数)
+    """
+    existing_results = read_all_results()
+    existing_dates   = {r['date'] for r in existing_results}
+
+    # 从今天起向前生成候选日期，遇到已有日期就停（最多往前看 30 个自然日防死循环）
+    candidates = []
+    d = datetime.today()
+    for _ in range(30):
+        ds = d.strftime('%Y-%m-%d')
+        if ds in existing_dates:
+            break          # 碰到已有数据，停止往前看
+        candidates.append(ds)
+        d -= timedelta(days=1)
+
+    if not candidates:
+        print(f'   最新数据已是今天，无需更新。')
+        return existing_results, 0
+
+    print(f'   待检查日期: {candidates[-1]} ~ {candidates[0]}（{len(candidates)} 个自然日）')
+    print('   Ctrl+C 可随时中断，已抓到的新数据会保存')
+    print('=' * 60)
+
+    # 正序抓取（从旧到新），便于连续失败时已有较早数据
+    date_list = list(reversed(candidates))
+
+    new_records, stop_reason = fetch_dates(date_list, existing_dates, '增量')
+
+    # 合并去重，保持倒序（与历史下载一致）
+    merged_map = {r['date']: r for r in existing_results}
+    for r in new_records:
+        merged_map[r['date']] = r
+    merged_results = sorted(merged_map.values(), key=lambda x: x['date'], reverse=True)
+
+    new_count = len(new_records)
+    if new_count > 0:
+        if stop_reason == 'completed':
+            note = f'增量更新完成，新增 {new_count} 天'
+        else:
+            note = f'增量更新中断（{stop_reason}），已新增 {new_count} 天'
+        save_checkpoint(merged_results, note=note)
+        print(f'\n✅ 新增 {new_count} 个交易日，已合并保存 → {CHECKPOINT}')
+    else:
+        if stop_reason == 'completed':
+            print(f'\n✅ 检查完毕，期间暂无新交易日数据（可能是节假日或数据尚未发布）。')
+        else:
+            print(f'\n⚠  更新中断（{stop_reason}），未获取到新数据。')
+
+    return merged_results, new_count
+
 
 def collect_history():
     """
@@ -543,24 +655,42 @@ def main():
     print('  上交所宽基 ETF 规模监控')
     print('=' * 60)
 
-    # ── 自动判断模式 ──────────────────────────────────────────────────────────
-    if history_is_complete():
-        # 历史数据完整 → 增量更新
+    today          = today_str()
+    existing_dates = get_existing_dates()
+    earliest       = min(existing_dates) if existing_dates else None
+    latest         = max(existing_dates) if existing_dates else None
+    history_done   = (earliest is not None and earliest <= CUTOFF_DATE.strftime('%Y-%m-%d'))
+
+    print(f'📅 当前日期        : {today}')
+    print(f'📂 已有数据范围    : {earliest} ~ {latest}（{len(existing_dates)} 个交易日）' if existing_dates else '📂 暂无本地数据')
+    print(f'📚 历史已补全至2020: {"是" if history_done else "否"}')
+    print()
+
+    # ── Step 1：增量更新（先把最近几天补齐） ──────────────────────────────────
+    # 只要 latest 不是今天，就尝试从 latest 的次日到今天补充新数据
+    need_increment = (latest is None or latest < today)
+    if need_increment:
+        print(f'▶  Step 1：增量更新 — 补充 {(latest or "无") + " 之后"} 到今天的新数据')
         results, new_count = incremental_update()
-        completed = True
-        if new_count == 0 and results:
-            # 无新数据且文件存在，询问是否重新生成输出文件
-            print('\n是否重新生成 HTML / Excel？(y/n，默认 n)', end=' ')
-            try:
-                ans = input().strip().lower()
-            except Exception:
-                ans = 'n'
-            if ans != 'y':
-                print('跳过生成，退出。')
-                return
+        if new_count > 0:
+            print(f'   本次新增 {new_count} 个交易日。')
+        else:
+            print('   近期无新交易日数据（节假日或数据尚未发布）。')
+        # 增量完成后刷新 existing_dates / earliest
+        existing_dates = get_existing_dates()
+        earliest       = min(existing_dates) if existing_dates else None
+        history_done   = (earliest is not None and earliest <= CUTOFF_DATE.strftime('%Y-%m-%d'))
     else:
-        # 历史尚未完整 → 历史下载（含续传）
+        print(f'▶  Step 1：增量更新 — 今天数据已存在，跳过。')
+        results = read_all_results()
+
+    # ── Step 2：历史补全（把数据向过去补到 2020-01-01） ──────────────────────
+    if not history_done:
+        print(f'\n▶  Step 2：历史补全 — 继续向过去补全至 2020-01-01（当前最早: {earliest}）')
         results, completed = collect_history()
+    else:
+        print(f'\n▶  Step 2：历史已补全至 2020-01-01，跳过。')
+        completed = True
 
     if not results:
         print('\n❌ 无数据，请检查网络后重试。')
@@ -575,7 +705,7 @@ def main():
         webbrowser.open(OUTPUT_HTML)
         print('\n🌐 已在浏览器打开 HTML 看板。')
     else:
-        print('\n📊 已生成当前数据预览，下次续传完成后将自动更新。')
+        print('\n📊 已生成当前数据预览，下次运行将继续历史补全。')
 
 
 if __name__ == '__main__':
