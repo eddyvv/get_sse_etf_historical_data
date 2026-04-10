@@ -30,8 +30,8 @@ ETF_MAP = {
     '588080': '易方达上证科创板50ETF',
 }
 
-TARGET_DAYS   = 5    # 目标有效交易日数量
-MAX_LOOK_BACK = 15   # 最多向前追溯的自然日数（5天 + 节假日缓冲）
+TARGET_DAYS   = 1500  # 2020至今约1500个交易日
+MAX_LOOK_BACK = 2500  # 自然日缓冲（含节假日）
 OUTPUT_HTML   = 'sse_final_dashboard.html'
 OUTPUT_EXCEL  = 'sse_etf_data.xlsx'
 
@@ -67,10 +67,17 @@ def fetch_day(date_str):
 def collect_trading_days():
     results = []
     today   = datetime.today()
+    cutoff  = datetime(2020, 1, 1)   # 不抓 2020 年以前的数据
+
     for offset in range(MAX_LOOK_BACK):
         if len(results) >= TARGET_DAYS:
             break
-        d        = today - timedelta(days=offset)
+
+        d = today - timedelta(days=offset)
+        if d < cutoff:                # 到达截止日期则停止
+            print(f'已到达截止日期 2020-01-01，停止采集。')
+            break
+
         date_str = d.strftime('%Y-%m-%d')
         print(f'正在同步 {date_str}... (已获取 {len(results)}/{TARGET_DAYS} 交易日)', end='  ')
         items = fetch_day(date_str)
@@ -314,7 +321,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h2>上交所宽基 ETF 规模监控看板（近5个交易日 / 单位：万份）</h2>
+  <h2>上交所宽基 ETF 规模监控看板（2020年至今 / 单位：万份）</h2>
   <div class="tabs-container" id="tabs"></div>
   <div class="chart-container" id="chart"></div>
 
@@ -329,7 +336,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         title: '统计日期（YYYY-MM-DD）',
         type:  'category',
         tickmode: 'linear',
-        dtick:    1,
+        dtick:    30,
         tickangle: -45,
         gridcolor: '#f0f0f0'
       },
