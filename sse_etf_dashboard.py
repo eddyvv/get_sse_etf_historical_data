@@ -42,7 +42,7 @@ ETF_MAP = {
     '588080': '易方达上证科创板50ETF',
 }
 
-TARGET_DAYS      = 1500
+TARGET_DAYS      = 1520
 CUTOFF_DATE      = datetime(2020, 1, 1)
 OUTPUT_HTML      = 'sse_final_dashboard.html'
 OUTPUT_EXCEL     = 'sse_etf_data.xlsx'
