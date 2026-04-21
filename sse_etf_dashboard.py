@@ -93,22 +93,38 @@ def load_checkpoint():
 
 
 def save_checkpoint(results, note=''):
-    """原子写入断点文件，永久保留。"""
+    """原子写入断点文件，永久保留。
+    每只 ETF 仅保留 SEC_CODE + TOT_VOL 字段，大幅压缩体积。"""
     if not results:
         return
     dates     = [r['date'] for r in results]
     last_date = min(dates)   # 最早（历史最远）
     first_date = max(dates)  # 最新（最近今天）
+
+    # 过滤：仅保留 ETF_MAP 中的 ETF，且只存 SEC_CODE + TOT_VOL
+    tracked_codes = set(ETF_MAP.keys())
+    slim_results = []
+    for day in results:
+        slim_items = []
+        for item in day.get('items', []):
+            code = str(item.get('SEC_CODE', '')).strip()
+            if code in tracked_codes:
+                slim_items.append({
+                    'SEC_CODE': code,
+                    'TOT_VOL':  item.get('TOT_VOL'),
+                })
+        slim_results.append({'date': day['date'], 'items': slim_items})
+
     tmp = CHECKPOINT + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump({
             'last_date':  last_date,
             'first_date': first_date,
-            'count':      len(results),
+            'count':      len(slim_results),
             'saved_at':   datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'note':       note,
-            'results':    results,
-        }, f, ensure_ascii=False)
+            'results':    slim_results,
+        }, f, ensure_ascii=False, separators=(',', ':'))
     os.replace(tmp, CHECKPOINT)
 
 
@@ -233,112 +249,6 @@ def fetch_dates(date_list, existing_dates, mode_label, is_recent=False):
 
 
 # ── 5. 历史下载模式 ────────────────────────────────────────────────────────────
-
-def collect_history():
-    """
-    从今天/断点起向过去方向逐日抓取，直到 CUTOFF_DATE 或 TARGET_DAYS。
-    返回 (results, completed布尔)
-    """
-    results, last_date = load_checkpoint()
-    existing_dates     = {r['date'] for r in results}
-
-    if last_date:
-        start = datetime.strptime(last_date, '%Y-%m-%d') - timedelta(days=1)
-        print(f'▶  历史下载（续传），从 {start.strftime("%Y-%m-%d")} 继续向前')
-    else:
-        start = datetime.today()
-        print(f'▶  历史下载（首次），从今天起向前追溯')
-
-    print(f'   目标 {TARGET_DAYS} 个交易日 | 截止 {CUTOFF_DATE.strftime("%Y-%m-%d")}')
-    print('   Ctrl+C 可随时中断并保存进度')
-    print('=' * 60)
-
-    # 生成待抓日期列表（倒序：从 start 到 CUTOFF_DATE）
-    date_list = []
-    d = start
-    while d >= CUTOFF_DATE and (len(existing_dates) + len(date_list)) < TARGET_DAYS:
-        date_list.append(d.strftime('%Y-%m-%d'))
-        d -= timedelta(days=1)
-
-    new_records, stop_reason = fetch_dates(date_list, existing_dates, '历史')
-
-    # 合并
-    for r in new_records:
-        results.append(r)
-        existing_dates.add(r['date'])
-        save_checkpoint(results, note='运行中')   # 实时持久化
-
-    completed = (stop_reason == 'completed')
-
-    if stop_reason == 'interrupt':
-        save_checkpoint(results, note='Ctrl+C 中断')
-        print(f'✅ 已保存 {len(results)} 个交易日 → {CHECKPOINT}，下次运行自动续传')
-    elif stop_reason == 'network':
-        save_checkpoint(results, note='断网自动保存')
-        print(f'🔌 断网，已保存 {len(results)} 个交易日 → {CHECKPOINT}，恢复网络后重新运行')
-    else:
-        save_checkpoint(results, note='全量采集完成')
-        print(f'✅ 历史数据采集完成，共 {len(results)} 个交易日，断点文件永久保留')
-
-    return results, completed
-
-
-# ── 6. 增量更新模式 ────────────────────────────────────────────────────────────
-
-def incremental_update():
-    """
-    增量更新：从今天起往前逐日检查，遇到已在 checkpoint 中的日期即停止。
-    将新抓到的数据追加合并后保存。
-    返回 (merged_results列表, 新增天数)
-    """
-    existing_results = read_all_results()
-    existing_dates   = {r['date'] for r in existing_results}
-
-    # 从今天起向前生成候选日期，遇到已有日期就停（最多往前看 30 个自然日防死循环）
-    candidates = []
-    d = datetime.today()
-    for _ in range(30):
-        ds = d.strftime('%Y-%m-%d')
-        if ds in existing_dates:
-            break          # 碰到已有数据，停止往前看
-        candidates.append(ds)
-        d -= timedelta(days=1)
-
-    if not candidates:
-        print(f'   最新数据已是今天，无需更新。')
-        return existing_results, 0
-
-    print(f'   待检查日期: {candidates[-1]} ~ {candidates[0]}（{len(candidates)} 个自然日）')
-    print('   Ctrl+C 可随时中断，已抓到的新数据会保存')
-    print('=' * 60)
-
-    # 正序抓取（从旧到新），便于连续失败时已有较早数据
-    date_list = list(reversed(candidates))
-
-    new_records, stop_reason = fetch_dates(date_list, existing_dates, '增量', is_recent=True)
-
-    # 合并去重，保持倒序（与历史下载一致）
-    merged_map = {r['date']: r for r in existing_results}
-    for r in new_records:
-        merged_map[r['date']] = r
-    merged_results = sorted(merged_map.values(), key=lambda x: x['date'], reverse=True)
-
-    new_count = len(new_records)
-    if new_count > 0:
-        if stop_reason == 'completed':
-            note = f'增量更新完成，新增 {new_count} 天'
-        else:
-            note = f'增量更新中断（{stop_reason}），已新增 {new_count} 天'
-        save_checkpoint(merged_results, note=note)
-        print(f'\n✅ 新增 {new_count} 个交易日，已合并保存 → {CHECKPOINT}')
-    else:
-        if stop_reason == 'completed':
-            print(f'\n✅ 检查完毕，期间暂无新交易日数据（可能是节假日或数据尚未发布）。')
-        else:
-            print(f'\n⚠  更新中断（{stop_reason}），未获取到新数据。')
-
-    return merged_results, new_count
-
 
 def collect_history():
     """
